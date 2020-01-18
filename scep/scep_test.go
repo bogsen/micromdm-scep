@@ -65,7 +65,7 @@ func TestDecryptPKIEnvelopeCert(t *testing.T) {
 	// }
 }
 
-func TestSignCSR(t *testing.T) {
+func TestReturnCertRep(t *testing.T) {
 	pkcsReq := loadTestFile(t, "testdata/PKCSReq.der")
 	msg := testParsePKIMessage(t, pkcsReq)
 	cacert, cakey := loadCACredentials(t)
@@ -78,7 +78,7 @@ func TestSignCSR(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tmpl := &x509.Certificate{
+	cert := &x509.Certificate{
 		SerialNumber: big.NewInt(4),
 		Subject:      csr.Subject,
 		NotBefore:    time.Now().Add(-600).UTC(),
@@ -89,7 +89,7 @@ func TestSignCSR(t *testing.T) {
 			x509.ExtKeyUsageClientAuth,
 		},
 	}
-	certRep, err := msg.SignCSR(cacert, cakey, tmpl)
+	certRep, err := msg.ReturnCertRep(cacert, cakey, cert)
 	if err != nil {
 		t.Fatal(err)
 	}

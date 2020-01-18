@@ -3,6 +3,7 @@ package scepserver
 import (
 	"context"
 	"crypto"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha1"
 	"crypto/x509"
@@ -39,6 +40,16 @@ type Service interface {
 	GetNextCACert(ctx context.Context) ([]byte, error)
 }
 
+type CertificateSource interface {
+	ObtainCertificate(ctx context.Context, msg *scep.PKIMessage) (*x509.Certificate, error)
+}
+
+type CertificateSourceFunc func(ctx context.Context, msg *scep.PKIMessage) (*x509.Certificate, error)
+
+func (f CertificateSourceFunc) ObtainCertificate(ctx context.Context, msg *scep.PKIMessage) (*x509.Certificate, error) {
+	return f(ctx, msg)
+}
+
 type service struct {
 	depot                   depot.Depot
 	ca                      []*x509.Certificate // CA cert or chain
@@ -49,6 +60,7 @@ type service struct {
 	supportDynamciChallenge bool
 	dynamicChallengeStore   challenge.Store
 	csrVerifier             csrverifier.CSRVerifier
+	certificateSource       CertificateSource
 	allowRenewal            int // days before expiry, 0 to disable
 	clientValidity          int // client cert validity in days
 
@@ -120,6 +132,40 @@ func (svc *service) PKIOperation(ctx context.Context, data []byte) ([]byte, erro
 		}
 	}
 
+	certSrc := svc.certificateSource
+	if certSrc == nil {
+		certSrc = CertificateSourceFunc(svc.createCertificate)
+	}
+
+	crt, err := certSrc.ObtainCertificate(ctx, msg)
+	if err != nil {
+		return nil, err
+	}
+	name := certName(crt)
+
+	certRep, err := msg.ReturnCertRep(ca, svc.caKey, crt)
+	if err != nil {
+		return nil, err
+	}
+
+	// Test if this certificate is already in the CADB, revoke if needed
+	// revocation is done if the validity of the existing certificate is
+	// less than allowRenewal (14 days by default)
+	_, err = svc.depot.HasCN(name, svc.allowRenewal, crt, false)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := svc.depot.Put(name, crt); err != nil {
+		return nil, err
+	}
+
+	return certRep.Raw, nil
+}
+
+func (svc *service) createCertificate(ctx context.Context, msg *scep.PKIMessage) (*x509.Certificate, error) {
+	ca := svc.ca[0]
+
 	csr := msg.CSRReqMessage.CSR
 	id, err := generateSubjectKeyID(csr.PublicKey)
 	if err != nil {
@@ -147,27 +193,19 @@ func (svc *service) PKIOperation(ctx context.Context, data []byte) ([]byte, erro
 		SignatureAlgorithm: csr.SignatureAlgorithm,
 	}
 
-	certRep, err := msg.SignCSR(ca, svc.caKey, tmpl)
+	// sign the CSR creating a DER encoded cert
+	crtBytes, err := x509.CreateCertificate(rand.Reader, tmpl, ca, msg.CSRReqMessage.CSR.PublicKey, svc.caKey)
 	if err != nil {
 		return nil, err
 	}
 
-	crt := certRep.CertRepMessage.Certificate
-	name := certName(crt)
-
-	// Test if this certificate is already in the CADB, revoke if needed
-	// revocation is done if the validity of the existing certificate is
-	// less than allowRenewal (14 days by default)
-	_, err = svc.depot.HasCN(name, svc.allowRenewal, crt, false)
+	// parse the certificate
+	crt, err := x509.ParseCertificate(crtBytes)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := svc.depot.Put(name, crt); err != nil {
-		return nil, err
-	}
-
-	return certRep.Raw, nil
+	return crt, nil
 }
 
 func certName(crt *x509.Certificate) string {
@@ -261,6 +299,13 @@ func WithDynamicChallenges(cache challenge.Store) ServiceOption {
 	return func(s *service) error {
 		s.supportDynamciChallenge = true
 		s.dynamicChallengeStore = cache
+		return nil
+	}
+}
+
+func WithCertificateSource(source CertificateSource) ServiceOption {
+	return func(s *service) error {
+		s.certificateSource = source
 		return nil
 	}
 }
